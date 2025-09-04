@@ -11,6 +11,7 @@
   // Configuration variables, set once onMount. Not $state.
   let apiKey: string = '';
   let model = $state('gpt-4o-mini');     // default fallback
+  let modelName = $state('gpt-4o-mini');     // default fallback
   let endpoint: string = '/api/chat/completions'; // relative to current host by default
 
   // Configure marked for secure rendering
@@ -31,10 +32,13 @@
       const qs = new URLSearchParams(window.location.search);
       const qsApiKey = qs.get('api_key');
       const qsModel = qs.get('model');
+      const qsModelName = qs.get('model_name');
       const qsEndpoint = qs.get('endpoint');
 
       if (qsApiKey !== null) apiKey = qsApiKey;
       if (qsModel !== null) model = qsModel;
+      if (qsModelName !== null) modelName = qsModelName;
+      else modelName = model;
       if (qsEndpoint !== null) endpoint = qsEndpoint;
       // Default values are already set if query params are null
 
@@ -57,6 +61,7 @@
   async function send() {
     const text = input.trim();
     if (!text || isLoading) return;
+    const currentFocus = document.activeElement;
 
     // optimistic UI
     messages = [...messages, { role: 'user', content: text }];
@@ -72,7 +77,7 @@
         },
         body: JSON.stringify({
           model,
-          messages: [{ role: 'user', content: text }]
+          messages //: [{ role: 'user', content: text }]
         })
       });
       const data = await res.json();
@@ -82,7 +87,11 @@
       messages = [...messages, { role: 'assistant', content: '⚠️ Network error' }];
     } finally {
       isLoading = false;
+      setTimeout(() => currentFocus.focus(), 100);
     }
+  }
+  function clear() {
+    messages = [];
   }
 
   function enterToSend(e: KeyboardEvent) {
@@ -144,6 +153,10 @@
     font-size: 1rem;
     font-weight: 600;
     color: #202123;
+  }
+  .header-clear {
+    width: 100%;
+    text-align: right;
   }
 
   .messages {
@@ -392,7 +405,7 @@
     border: none;
     border-radius: 4px;
     background: #ffffff;
-    color: #8e8ea0;
+    color: #10a37f;
     cursor: pointer;
     transition: all 0.15s ease;
     display: flex;
@@ -410,6 +423,7 @@
   button:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+    color: #8e8ea0;
   }
 
   .send-icon {
@@ -456,9 +470,9 @@
         <path d="M2 12L12 17L22 12"></path>
       </svg>
     </div>
-    <div class="header-title">{model}</div>
+    <div class="header-title">{modelName}</div>
+    <div class="header-clear"><button onclick={clear} style="cursor: pointer;float: right;">🗑️</button></div>
   </div>
-
   <div class="messages" bind:this={messagesContainer}>
     {#each messages as message}
       <div class="message-wrapper {message.role}">
