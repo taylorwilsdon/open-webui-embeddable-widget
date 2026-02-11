@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { marked } from 'marked';
 
   // --- state --------------------------------------------------------------
@@ -8,39 +8,43 @@
   let isLoading = $state(false);
   let messagesContainer: HTMLDivElement;
 
-  // Configuration variables, set once onMount. Not $state.
+  // Configuration variables, set once onMount.
   let apiKey: string = '';
-  let model = $state('gpt-4o-mini');     // default fallback
-  let endpoint: string = '/api/chat/completions'; // relative to current host by default
+  let model = $state('gpt-4o-mini');
+  let endpoint: string = '/api/chat/completions';
+  let toolIds: string[] = [];
+  let title = $state('');
+  let prompts = $state<string[]>([]);
+
+  const defaultPrompts = [
+    'What is the cost of running an e2-medium VM in me-central2?',
+    'Estimate monthly cost for Cloud SQL in me-central2',
+    'What GCP services are available in me-central2?'
+  ];
 
   // Configure marked for secure rendering
-  marked.setOptions({
-    breaks: true,
-    gfm: true
-  });
+  marked.setOptions({ breaks: true, gfm: true });
 
-  // Function to safely render markdown
   function renderMarkdown(content: string): string {
     return marked.parse(content) as string;
   }
 
-  // --- initialize from query‑string --------------------------------------
+  function displayTitle(): string {
+    return title || 'GCP Cost Assistant';
+  }
+
+  // --- initialize from query-string --------------------------------------
   onMount(() => {
-    console.log('ChatWidget onMount triggered. Attempting to read query parameters.');
     try {
       const qs = new URLSearchParams(window.location.search);
-      const qsApiKey = qs.get('api_key');
-      const qsModel = qs.get('model');
-      const qsEndpoint = qs.get('endpoint');
-
-      if (qsApiKey !== null) apiKey = qsApiKey;
-      if (qsModel !== null) model = qsModel;
-      if (qsEndpoint !== null) endpoint = qsEndpoint;
-      // Default values are already set if query params are null
-
-      console.log('Query parameters processed:', { apiKey, model, endpoint });
+      if (qs.get('api_key') !== null) apiKey = qs.get('api_key')!;
+      if (qs.get('model') !== null) model = qs.get('model')!;
+      if (qs.get('endpoint') !== null) endpoint = qs.get('endpoint')!;
+      if (qs.get('tool_ids') !== null) toolIds = qs.get('tool_ids')!.split(',').filter(Boolean);
+      if (qs.get('title') !== null) title = qs.get('title')!;
+      if (qs.get('prompts') !== null) prompts = qs.get('prompts')!.split('|').filter(Boolean);
     } catch (e) {
-      console.error('Error processing query parameters in onMount:', e);
+      console.error('Error processing query parameters:', e);
     }
   });
 
@@ -54,11 +58,20 @@
   });
 
   // --- helpers ------------------------------------------------------------
+  function clearChat() {
+    messages = [];
+    input = '';
+  }
+
+  function sendPrompt(text: string) {
+    input = text;
+    send();
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || isLoading) return;
 
-    // optimistic UI
     messages = [...messages, { role: 'user', content: text }];
     input = '';
     isLoading = true;
@@ -72,14 +85,60 @@
         },
         body: JSON.stringify({
           model,
-          messages: [{ role: 'user', content: text }]
+          messages: messages.map(m => ({ role: m.role, content: m.content })),
+          stream: true,
+          ...(toolIds.length > 0 && { tool_ids: toolIds })
         })
       });
-      const data = await res.json();
-      const reply = data?.choices?.[0]?.message?.content ?? '⚠️ Error retrieving response';
-      messages = [...messages, { role: 'assistant', content: reply }];
+
+      if (!res.ok) {
+        messages = [...messages, { role: 'assistant', content: '\u26a0\ufe0f Error retrieving response' }];
+        return;
+      }
+
+      const reader = res.body?.getReader();
+      if (!reader) {
+        messages = [...messages, { role: 'assistant', content: '\u26a0\ufe0f Error retrieving response' }];
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let assistantContent = '';
+      messages = [...messages, { role: 'assistant', content: '' }];
+      isLoading = false;
+
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed?.choices?.[0]?.delta?.content;
+            if (delta) {
+              assistantContent += delta;
+              messages = [...messages.slice(0, -1), { role: 'assistant', content: assistantContent }];
+            }
+          } catch {
+            // skip non-JSON lines
+          }
+        }
+      }
+
+      if (!assistantContent) {
+        messages = [...messages.slice(0, -1), { role: 'assistant', content: '\u26a0\ufe0f Error retrieving response' }];
+      }
     } catch (err) {
-      messages = [...messages, { role: 'assistant', content: '⚠️ Network error' }];
+      messages = [...messages, { role: 'assistant', content: '\u26a0\ufe0f Network error' }];
     } finally {
       isLoading = false;
     }
@@ -119,7 +178,7 @@
   }
 
   .header {
-    padding: 1rem 1.25rem;
+    padding: 0.875rem 1.25rem;
     background: #ffffff;
     border-bottom: 1px solid #e5e5e5;
     display: flex;
@@ -130,7 +189,7 @@
   .header-icon {
     width: 28px;
     height: 28px;
-    background: #10a37f;
+    background: #4285f4;
     border-radius: 6px;
     display: flex;
     align-items: center;
@@ -141,11 +200,106 @@
   }
 
   .header-title {
-    font-size: 1rem;
+    font-size: 0.9375rem;
     font-weight: 600;
     color: #202123;
+    flex: 1;
   }
 
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .header-btn {
+    padding: 0.25rem;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: #8e8ea0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    transition: all 0.15s ease;
+  }
+
+  .header-btn:hover {
+    color: #202123;
+    background: #f0f0f0;
+  }
+
+  /* Welcome screen */
+  .welcome {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1.5rem;
+    text-align: center;
+    gap: 1rem;
+  }
+
+  .welcome-icon {
+    width: 48px;
+    height: 48px;
+    background: #4285f4;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+  }
+
+  .welcome-title {
+    font-size: 1.125rem;
+    font-weight: 600;
+    color: #202123;
+    margin: 0;
+  }
+
+  .welcome-subtitle {
+    font-size: 0.8125rem;
+    color: #8e8ea0;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .suggested-prompts {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: 100%;
+    max-width: 320px;
+    margin-top: 0.5rem;
+  }
+
+  .prompt-btn {
+    padding: 0.625rem 0.875rem;
+    border: 1px solid #e5e5e5;
+    border-radius: 8px;
+    background: #ffffff;
+    color: #353740;
+    font-size: 0.8125rem;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    line-height: 1.4;
+    width: 100%;
+    display: block;
+  }
+
+  .prompt-btn:hover {
+    border-color: #4285f4;
+    background: #f8f9ff;
+  }
+
+  /* Messages area */
   .messages {
     flex: 1;
     overflow-y: auto;
@@ -187,9 +341,9 @@
   }
 
   .avatar {
-    width: 30px;
-    height: 30px;
-    border-radius: 2px;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
     flex-shrink: 0;
     display: flex;
     align-items: center;
@@ -204,7 +358,7 @@
   }
 
   .avatar.assistant {
-    background: #10a37f;
+    background: #4285f4;
   }
 
   .message {
@@ -216,7 +370,6 @@
     animation: slideIn 0.3s ease-out;
   }
 
-  /* Markdown content styling - :global() to avoid unused selector warnings */
   :global(.markdown-content h1),
   :global(.markdown-content h2),
   :global(.markdown-content h3),
@@ -293,12 +446,12 @@
   }
 
   :global(.markdown-content a) {
-    color: #10a37f;
+    color: #4285f4;
     text-decoration: underline;
   }
 
   :global(.markdown-content a:hover) {
-    color: #0d8f6b;
+    color: #3367d6;
   }
 
   :global(.markdown-content hr) {
@@ -359,13 +512,13 @@
     gap: 0.75rem;
     background: #ffffff;
     border: 1px solid #d9d9e3;
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 0.75rem 0.75rem 0.75rem 1rem;
     transition: border-color 0.2s ease;
   }
 
   .input-wrapper:focus-within {
-    border-color: #10a37f;
+    border-color: #4285f4;
   }
 
   textarea {
@@ -387,12 +540,12 @@
     color: #8e8ea0;
   }
 
-  button {
+  .send-btn {
     padding: 0.375rem;
     border: none;
-    border-radius: 4px;
-    background: #ffffff;
-    color: #8e8ea0;
+    border-radius: 6px;
+    background: #4285f4;
+    color: #ffffff;
     cursor: pointer;
     transition: all 0.15s ease;
     display: flex;
@@ -403,11 +556,11 @@
     flex-shrink: 0;
   }
 
-  button:hover:not(:disabled) {
-    color: #202123;
+  .send-btn:hover:not(:disabled) {
+    background: #3367d6;
   }
 
-  button:disabled {
+  .send-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
   }
@@ -418,32 +571,18 @@
   }
 
   @keyframes fadeIn {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 1;
-    }
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   @keyframes slideIn {
-    from {
-      transform: translateY(5px);
-      opacity: 0;
-    }
-    to {
-      transform: translateY(0);
-      opacity: 1;
-    }
+    from { transform: translateY(5px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
   }
 
   @keyframes bounce {
-    0%, 80%, 100% {
-      transform: scale(0);
-    }
-    40% {
-      transform: scale(1);
-    }
+    0%, 80%, 100% { transform: scale(0); }
+    40% { transform: scale(1); }
   }
 </style>
 
@@ -451,66 +590,88 @@
   <div class="header">
     <div class="header-icon">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M12 2L2 7L12 12L22 7L12 2Z"></path>
-        <path d="M2 17L12 22L22 17"></path>
-        <path d="M2 12L12 17L22 12"></path>
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
       </svg>
     </div>
-    <div class="header-title">{model}</div>
-  </div>
-
-  <div class="messages" bind:this={messagesContainer}>
-    {#each messages as message}
-      <div class="message-wrapper {message.role}">
-        <div class="avatar {message.role}">
-          {#if message.role === 'user'}
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-              <circle cx="12" cy="7" r="4"></circle>
-            </svg>
-          {:else}
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 2L2 7L12 12L22 7L12 2Z"></path>
-              <path d="M2 17L12 22L22 17"></path>
-              <path d="M2 12L12 17L22 12"></path>
-            </svg>
-          {/if}
-        </div>
-        <div class="message markdown-content">
-          {@html renderMarkdown(message.content)}
-        </div>
-      </div>
-    {/each}
-
-    {#if isLoading}
-      <div class="message-wrapper assistant">
-        <div class="avatar assistant">
+    <div class="header-title">{displayTitle()}</div>
+    <div class="header-actions">
+      {#if messages.length > 0}
+        <button class="header-btn" onclick={clearChat} title="New chat">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 2L2 7L12 12L22 7L12 2Z"></path>
-            <path d="M2 17L12 22L22 17"></path>
-            <path d="M2 12L12 17L22 12"></path>
+            <path d="M12 5v14M5 12h14"></path>
           </svg>
-        </div>
-        <div class="loading-dots">
-          <div class="loading-dot"></div>
-          <div class="loading-dot"></div>
-          <div class="loading-dot"></div>
-        </div>
-      </div>
-    {/if}
+        </button>
+      {/if}
+    </div>
   </div>
+
+  {#if messages.length === 0 && !isLoading}
+    <div class="welcome">
+      <div class="welcome-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+      </div>
+      <h2 class="welcome-title">How can I help?</h2>
+      <p class="welcome-subtitle">Ask questions about GCP costs, pricing, and service availability across regions.</p>
+      <div class="suggested-prompts">
+        {#each prompts.length > 0 ? prompts : defaultPrompts as prompt}
+          <button class="prompt-btn" onclick={() => sendPrompt(prompt)}>
+            {prompt}
+          </button>
+        {/each}
+      </div>
+    </div>
+  {:else}
+    <div class="messages" bind:this={messagesContainer}>
+      {#each messages as message}
+        <div class="message-wrapper {message.role}">
+          <div class="avatar {message.role}">
+            {#if message.role === 'user'}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+              </svg>
+            {/if}
+          </div>
+          <div class="message markdown-content">
+            {@html renderMarkdown(message.content)}
+          </div>
+        </div>
+      {/each}
+
+      {#if isLoading}
+        <div class="message-wrapper assistant">
+          <div class="avatar assistant">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            </svg>
+          </div>
+          <div class="loading-dots">
+            <div class="loading-dot"></div>
+            <div class="loading-dot"></div>
+            <div class="loading-dot"></div>
+          </div>
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   <div class="input-container">
     <form onsubmit={event => { event.preventDefault(); send(); }}>
       <div class="input-wrapper">
         <textarea
           bind:value={input}
-          placeholder="Send a message..."
+          placeholder="Ask about GCP costs and pricing..."
           onkeydown={enterToSend}
           oninput={adjustTextareaHeight}
           disabled={isLoading}
         ></textarea>
-        <button type="submit" aria-label="Send message" disabled={!input.trim() || isLoading}>
+        <button type="submit" class="send-btn" aria-label="Send message" disabled={!input.trim() || isLoading}>
           <svg class="send-icon" viewBox="0 0 24 24" fill="currentColor">
             <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path>
           </svg>
